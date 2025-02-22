@@ -125,8 +125,20 @@ export const listJobs = graphql(/* GraphQL */ `
 `)
 
 export const listSecuredUsers = graphql(/* GraphQL */ `
-  query ListUsers($after: String, $before: String, $first: Int, $last: Int) {
-    users(after: $after, before: $before, first: $first, last: $last) {
+  query ListUsers(
+    $ids: [ID!]
+    $after: String
+    $before: String
+    $first: Int
+    $last: Int
+  ) {
+    users(
+      ids: $ids
+      after: $after
+      before: $before
+      first: $first
+      last: $last
+    ) {
       edges {
         node {
           id
@@ -445,6 +457,9 @@ export const listThreadMessages = graphql(/* GraphQL */ `
                 merged
               }
             }
+            codeFileList {
+              fileList
+            }
           }
         }
         cursor
@@ -515,6 +530,77 @@ export const repositorySourceListQuery = graphql(/* GraphQL */ `
       sourceId
       sourceName
       sourceKind
+    }
+  }
+`)
+
+export const listPages = graphql(/* GraphQL */ `
+  query ListPages(
+    $ids: [ID!]
+    $after: String
+    $before: String
+    $first: Int
+    $last: Int
+  ) {
+    pages(
+      ids: $ids
+      after: $after
+      before: $before
+      first: $first
+      last: $last
+    ) {
+      edges {
+        node {
+          id
+          authorId
+          title
+          content
+          createdAt
+          updatedAt
+        }
+        cursor
+      }
+      pageInfo {
+        hasNextPage
+        hasPreviousPage
+        startCursor
+        endCursor
+      }
+    }
+  }
+`)
+
+export const listPageSections = graphql(/* GraphQL */ `
+  query ListPageSections(
+    $pageId: ID!
+    $after: String
+    $before: String
+    $first: Int
+    $last: Int
+  ) {
+    pageSections(
+      pageId: $pageId
+      after: $after
+      before: $before
+      first: $first
+      last: $last
+    ) {
+      edges {
+        node {
+          id
+          pageId
+          title
+          content
+          position
+        }
+        cursor
+      }
+      pageInfo {
+        hasNextPage
+        hasPreviousPage
+        startCursor
+        endCursor
+      }
     }
   }
 `)

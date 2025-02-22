@@ -1,5 +1,5 @@
-import type { Connection, CancellationToken } from "vscode-languageserver";
-import type { TextDocument } from "vscode-languageserver-textdocument";
+import type { Connection, CancellationToken, Range, URI } from "vscode-languageserver";
+import { TextDocument } from "vscode-languageserver-textdocument";
 import type { TextDocuments } from "../lsp/textDocuments";
 import type { Feature } from "../feature";
 import type { Configurations } from "../config";
@@ -17,14 +17,23 @@ import {
   ChatEditMutexError,
   ServerCapabilities,
   ChatEditResolveParams,
+  ClientCapabilities,
+  ReadFileParams,
+  ReadFileRequest,
 } from "../protocol";
 import cryptoRandomString from "crypto-random-string";
 import { isEmptyRange } from "../utils/range";
-import { readResponseStream, Edit, applyWorkspaceEdit } from "./utils";
+import { isBlank, formatPlaceholders } from "../utils/string";
+import { readResponseStream, Edit, applyWorkspaceEdit, truncateFileContent } from "./utils";
 import { initMutexAbortController, mutexAbortController, resetMutexAbortController } from "./global";
+import { readFile } from "fs-extra";
+import { getLogger } from "../logger";
+import { isBrowser } from "../env";
 
 export class ChatEditProvider implements Feature {
+  private logger = getLogger("ChatEditProvider");
   private lspConnection: Connection | undefined = undefined;
+  private clientCapabilities: ClientCapabilities | undefined = undefined;
   private currentEdit: Edit | undefined = undefined;
 
   constructor(
@@ -33,8 +42,9 @@ export class ChatEditProvider implements Feature {
     private readonly documents: TextDocuments<TextDocument>,
   ) {}
 
-  initialize(connection: Connection): ServerCapabilities {
+  initialize(connection: Connection, clientCapabilities: ClientCapabilities): ServerCapabilities {
     this.lspConnection = connection;
+    this.clientCapabilities = clientCapabilities;
     connection.onRequest(ChatEditCommandRequest.type, async (params) => {
       return this.provideEditCommands(params);
     });
@@ -92,6 +102,44 @@ export class ChatEditProvider implements Feature {
     return result;
   }
 
+  async fetchFileContent(uri: URI, range?: Range, token?: CancellationToken) {
+    this.logger.trace("Prepare to fetch text content...");
+    let text: string | undefined = undefined;
+    const targetDocument = this.documents.get(uri);
+    if (targetDocument) {
+      this.logger.trace("Fetching text content from synced text document.", {
+        uri: targetDocument.uri,
+        range: range,
+      });
+      text = targetDocument.getText(range);
+      this.logger.trace("Fetched text content from synced text document.", { text });
+    } else if (this.clientCapabilities?.tabby?.workspaceFileSystem) {
+      const params: ReadFileParams = {
+        uri: uri,
+        format: "text",
+        range: range
+          ? {
+              start: { line: range.start.line, character: 0 },
+              end: { line: range.end.line, character: range.end.character },
+            }
+          : undefined,
+      };
+      this.logger.trace("Fetching text content from ReadFileRequest.", { params });
+      const result = await this.lspConnection?.sendRequest(ReadFileRequest.type, params, token);
+      this.logger.trace("Fetched text content from ReadFileRequest.", { result });
+      text = result?.text;
+    } else if (!isBrowser) {
+      try {
+        const content = await readFile(uri, "utf-8");
+        const textDocument = TextDocument.create(uri, "text", 0, content);
+        text = textDocument.getText(range);
+      } catch (error) {
+        this.logger.trace("Failed to fetch text content from file system.", { error });
+      }
+    }
+    return text;
+  }
+
   async provideEdit(params: ChatEditParams, token: CancellationToken): Promise<ChatEditToken | null> {
     if (params.format !== "previewChanges") {
       return null;
@@ -109,11 +157,11 @@ export class ChatEditProvider implements Feature {
         message: "Chat feature not available",
       } as ChatFeatureNotAvailableError;
     }
-    const config = this.configurations.getMergedConfig();
+    const config = this.configurations.getMergedConfig().chat.edit;
 
     // FIXME(@icycodes): the command too long check is temporarily disabled,
     //    as we pass the diagnostics context as the command for now
-    // if (params.command.length > config.chat.edit.commandMaxChars) {
+    // if (params.command.length > config.commandMaxChars) {
     //   throw { name: "ChatEditCommandTooLongError", message: "Command too long" } as ChatEditCommandTooLongError;
     // }
 
@@ -123,14 +171,14 @@ export class ChatEditProvider implements Feature {
       end: document.offsetAt(params.location.range.end),
     };
     const selectedDocumentText = documentText.substring(selection.start, selection.end);
-    if (selection.end - selection.start > config.chat.edit.documentMaxChars) {
+    if (selection.end - selection.start > config.documentMaxChars) {
       throw { name: "ChatEditDocumentTooLongError", message: "Document too long" } as ChatEditDocumentTooLongError;
     }
 
     if (mutexAbortController && !mutexAbortController.signal.aborted) {
       throw {
         name: "ChatEditMutexError",
-        message: "Another smart edit is already in progress",
+        message: "Another chat edit is already in progress",
       } as ChatEditMutexError;
     }
 
@@ -140,17 +188,17 @@ export class ChatEditProvider implements Feature {
     let insertMode: boolean = isEmptyRange(params.location.range);
     const presetCommand = /^\/\w+\b/g.exec(params.command)?.[0];
     if (presetCommand) {
-      insertMode = config.chat.edit.presetCommands[presetCommand]?.kind === "insert";
+      insertMode = config.presetCommands[presetCommand]?.kind === "insert";
     }
 
     let promptTemplate: string;
     let userCommand: string;
-    const presetConfig = presetCommand && config.chat.edit.presetCommands[presetCommand];
+    const presetConfig = presetCommand && config.presetCommands[presetCommand];
     if (presetConfig) {
       promptTemplate = presetConfig.promptTemplate;
       userCommand = params.command.substring(presetCommand.length);
     } else {
-      promptTemplate = insertMode ? config.chat.edit.promptTemplate.insert : config.chat.edit.promptTemplate.replace;
+      promptTemplate = insertMode ? config.promptTemplate.insert : config.promptTemplate.replace;
       userCommand = params.command;
     }
 
@@ -158,8 +206,8 @@ export class ChatEditProvider implements Feature {
     const documentSelection = documentText.substring(selection.start, selection.end);
     let documentPrefix = documentText.substring(0, selection.start);
     let documentSuffix = documentText.substring(selection.end);
-    if (documentText.length > config.chat.edit.documentMaxChars) {
-      const charsRemain = config.chat.edit.documentMaxChars - documentSelection.length;
+    if (documentText.length > config.documentMaxChars) {
+      const charsRemain = config.documentMaxChars - documentSelection.length;
       if (documentPrefix.length < charsRemain / 2) {
         documentSuffix = documentSuffix.substring(0, charsRemain - documentPrefix.length);
       } else if (documentSuffix.length < charsRemain / 2) {
@@ -170,32 +218,49 @@ export class ChatEditProvider implements Feature {
       }
     }
 
+    const [fileContextListTemplate, fileContextItemTemplate] = config.fileContext.promptTemplate;
+    const fileContextItems =
+      (
+        await Promise.all(
+          (params.context ?? []).slice(0, config.fileContext.maxFiles).map(async (item) => {
+            const content = await this.fetchFileContent(item.uri, item.range, token);
+            if (!content || isBlank(content)) {
+              return undefined;
+            }
+            const fileContent = truncateFileContent(content, config.fileContext.maxCharsPerFile);
+            return formatPlaceholders(fileContextItemTemplate, {
+              filepath: item.uri,
+              referrer: item.referrer,
+              content: fileContent,
+            });
+          }),
+        )
+      )
+        .filter((item): item is string => item !== undefined)
+        .join("\n") ?? "";
+
+    const fileContext = !isBlank(fileContextItems)
+      ? formatPlaceholders(fileContextListTemplate, {
+          fileList: fileContextItems,
+        })
+      : "";
+
     const messages: { role: "user"; content: string }[] = [
       {
         role: "user",
-        content: promptTemplate.replace(
-          /{{filepath}}|{{documentPrefix}}|{{document}}|{{documentSuffix}}|{{command}}|{{languageId}}/g,
-          (pattern: string) => {
-            switch (pattern) {
-              case "{{filepath}}":
-                return params.location.uri;
-              case "{{documentPrefix}}":
-                return documentPrefix;
-              case "{{document}}":
-                return documentSelection;
-              case "{{documentSuffix}}":
-                return documentSuffix;
-              case "{{command}}":
-                return userCommand;
-              case "{{languageId}}":
-                return document.languageId;
-              default:
-                return "";
-            }
-          },
-        ),
+        content: formatPlaceholders(promptTemplate, {
+          filepath: params.location.uri,
+          documentPrefix: documentPrefix,
+          document: documentSelection,
+          documentSuffix: documentSuffix,
+          command: userCommand,
+          languageId: document.languageId,
+          fileContext: fileContext,
+        }),
       },
     ];
+    this.logger.debug(`messages: ${JSON.stringify(messages)}`);
+
     const readableStream = await this.tabbyApiClient.fetchChatStream(
       {
         messages,
@@ -231,8 +296,8 @@ export class ChatEditProvider implements Feature {
         this.currentEdit = undefined;
         resetMutexAbortController();
       },
-      config.chat.edit.responseDocumentTag,
-      config.chat.edit.responseCommentTag,
+      config.responseDocumentTag,
+      config.responseCommentTag,
     );
     return editId;
   }

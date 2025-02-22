@@ -107,7 +107,7 @@ export interface ErrorMessage {
 /**
  * Represents a filepath to identify a file.
  */
-export type Filepath = FilepathInGitRepository | FilepathUri
+export type Filepath = FilepathInGitRepository | FilepathInWorkspace | FilepathUri
 
 /**
  * This is used for files in a Git repository, and should be used in priority.
@@ -135,7 +135,26 @@ export interface FilepathInGitRepository {
 }
 
 /**
- * This is used for files not in a Git repository.
+ * This is used for files in the workspace, but not in a Git repository.
+ */
+export interface FilepathInWorkspace {
+  kind: 'workspace'
+
+  /**
+   * A string that is a relative path to `baseDir`.
+   */
+  filepath: string
+
+  /**
+   * A string that can be parsed as a URI, used to identify the directory in the client.
+   * The scheme of the URI could be 'file' or some other protocol to access the directory.
+   */
+  baseDir: string
+}
+
+/**
+ * This is used for files not in a Git repository and not in the workspace.
+ * Also used for untitled files not saved.
  */
 export interface FilepathUri {
   kind: 'uri'
@@ -245,11 +264,24 @@ export interface ListFilesInWorkspaceParams {
   limit?: number
 }
 
+export interface ListSymbolsParams {
+
+  query: string
+
+  limit?: number
+}
+
 export interface ListFileItem {
   /**
    * The filepath of the file.
    */
   filepath: Filepath
+}
+
+export interface ListSymbolItem {
+  filepath: Filepath
+  range: LineRange
+  label: string
 }
 
 export interface ServerApi {
@@ -345,6 +377,13 @@ export interface ClientApiMethods {
   listFileInWorkspace?: (params: ListFilesInWorkspaceParams) => Promise<ListFileItem[]>
 
   /**
+   * Returns active editor symbols when no query is provided. Otherwise, returns workspace symbols that match the query.
+   * @param params An {@link ListSymbolsParams} object that includes a search query and a limit for the results.
+   * @returns An array of {@link ListSymbolItem} objects that could be empty.
+   */
+  listSymbols?: (params: ListSymbolsParams) => Promise<ListSymbolItem[]>
+
+  /**
    * Returns the content of a file within the specified range.
    * If `range` is not provided, the entire file content is returned.
    * @param info A {@link FileRange} object that includes the file path and optionally a 1-based line range.
@@ -362,8 +401,8 @@ export interface ClientApi extends ClientApiMethods {
   hasCapability: (method: keyof ClientApiMethods) => Promise<boolean>
 }
 
-export function createClient(target: HTMLIFrameElement, api: ClientApiMethods): ServerApi {
-  return createThreadFromIframe(target, {
+export async function createClient(target: HTMLIFrameElement, api: ClientApiMethods): Promise<ServerApi> {
+  const thread = createThreadFromIframe(target, {
     expose: {
       refresh: api.refresh,
       onApplyInEditor: api.onApplyInEditor,
@@ -382,10 +421,18 @@ export function createClient(target: HTMLIFrameElement, api: ClientApiMethods): 
       readFileContent: api.readFileContent,
     },
   })
+
+  const serverMethods = await thread._requestMethods() as (keyof ServerApi)[]
+  const serverApi = {} as ServerApi
+  for (const method of serverMethods) {
+    serverApi[method] = thread[method]
+  }
+
+  return serverApi
 }
 
-export function createServer(api: ServerApi): ClientApi {
-  return createThreadFromInsideIframe({
+export async function createServer(api: ServerApi): Promise<ClientApi> {
+  const thread = createThreadFromInsideIframe({
     expose: {
       init: api.init,
       executeCommand: api.executeCommand,
@@ -396,4 +443,13 @@ export function createServer(api: ServerApi): ClientApi {
       updateActiveSelection: api.updateActiveSelection,
     },
   })
+  const clientMethods = await thread._requestMethods() as (keyof ClientApi)[]
+  const clientApi = {} as ClientApi
+  for (const method of clientMethods) {
+    clientApi[method] = thread[method]
+  }
+  // hasCapability is not exposed from client
+  clientApi.hasCapability = thread.hasCapability
+
+  return clientApi
 }
