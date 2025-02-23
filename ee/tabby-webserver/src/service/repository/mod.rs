@@ -1,16 +1,21 @@
 mod git;
+mod prompt_tools;
 mod third_party;
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use cached::{CachedAsync, TimedCache};
 use futures::StreamExt;
 use juniper::ID;
+use prompt_tools::pipeline_related_questions_with_repo_dirs;
 use tabby_common::config::{
     config_id_to_index, config_index_to_id, CodeRepository, Config, RepositoryConfig,
 };
 use tabby_db::DbConn;
+use tabby_inference::ChatCompletionStream;
 use tabby_schema::{
+    bail,
     integration::IntegrationService,
     job::JobService,
     policy::AccessPolicy,
@@ -20,12 +25,16 @@ use tabby_schema::{
     },
     Result,
 };
+use tokio::sync::Mutex;
 
 struct RepositoryServiceImpl {
     git: Arc<dyn GitRepositoryService>,
     third_party: Arc<dyn ThirdPartyRepositoryService>,
     config: Vec<RepositoryConfig>,
+    related_questions_cache: Mutex<TimedCache<String, Vec<String>>>,
 }
+
+const RELATED_QUESTIONS_CACHE_LIFESPAN: u64 = 60 * 30; // 30 minutes
 
 pub fn create(
     db: DbConn,
@@ -38,11 +47,69 @@ pub fn create(
         config: Config::load()
             .map(|config| config.repositories)
             .unwrap_or_default(),
+        related_questions_cache: Mutex::new(TimedCache::with_lifespan(
+            RELATED_QUESTIONS_CACHE_LIFESPAN,
+        )),
     })
+}
+
+impl RepositoryServiceImpl {
+    async fn find_repository_by_source_id(
+        &self,
+        policy: &AccessPolicy,
+        source_id: &str,
+    ) -> Result<Repository> {
+        let repositories = self.repository_list(Some(policy)).await?;
+        for repository in repositories {
+            if repository.source_id == source_id {
+                return Ok(repository);
+            }
+        }
+        bail!(
+            "Repository not found or 'source_id' is invalid: {}",
+            source_id
+        )
+    }
 }
 
 #[async_trait]
 impl RepositoryService for RepositoryServiceImpl {
+    async fn read_repository_related_questions(
+        &self,
+        chat: Arc<dyn ChatCompletionStream>,
+        policy: &AccessPolicy,
+        source_id: String,
+    ) -> Result<Vec<String>> {
+        if source_id.is_empty() {
+            return Err(anyhow::anyhow!("Invalid source_id format"))?;
+        }
+
+        let mut cache = self.related_questions_cache.lock().await;
+        let questions = cache
+            .try_get_or_set_with(source_id.clone(), || async {
+                let repository = self
+                    .find_repository_by_source_id(policy, &source_id)
+                    .await?;
+
+                let (files, truncated) = match self
+                    .list_files(policy, &repository.kind, &repository.id, None, Some(300))
+                    .await
+                {
+                    Ok((files, truncated)) => (files, truncated),
+                    Err(_) => {
+                        return Err(anyhow::anyhow!(
+                            "Repository exists but not accessible: {}",
+                            source_id
+                        ))?
+                    }
+                };
+
+                pipeline_related_questions_with_repo_dirs(chat, &repository, files, truncated).await
+            })
+            .await?;
+        Ok(questions.to_owned())
+    }
+
     async fn list_all_code_repository(&self) -> Result<Vec<CodeRepository>> {
         // Read repositories configured as git url.
         let mut repos: Vec<CodeRepository> = self
@@ -171,6 +238,33 @@ impl RepositoryService for RepositoryServiceImpl {
             .map_err(anyhow::Error::from)?;
 
         Ok(matching)
+    }
+
+    async fn list_files(
+        &self,
+        policy: &AccessPolicy,
+        kind: &RepositoryKind,
+        id: &ID,
+        rev: Option<&str>,
+        top_n: Option<usize>,
+    ) -> Result<(Vec<FileEntrySearchResult>, bool)> {
+        let dir = self.resolve_repository(policy, kind, id).await?.dir;
+        let (files, truncated) = tabby_git::list_files(&dir, rev, top_n)
+            .await
+            .map(|list_file| {
+                let files = list_file
+                    .files
+                    .into_iter()
+                    .map(|f| FileEntrySearchResult {
+                        r#type: f.r#type,
+                        path: f.path,
+                        indices: f.indices,
+                    })
+                    .collect();
+                (files, list_file.truncated)
+            })
+            .map_err(anyhow::Error::from)?;
+        Ok((files, truncated))
     }
 
     async fn grep(

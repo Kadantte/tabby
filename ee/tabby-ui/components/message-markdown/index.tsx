@@ -8,11 +8,17 @@ import {
   Maybe,
   MessageAttachmentClientCode
 } from '@/lib/gql/generates/graphql'
-import { AttachmentCodeItem, AttachmentDocItem, FileContext } from '@/lib/types'
+import {
+  AttachmentCodeItem,
+  AttachmentDocItem,
+  FileContext,
+  RelevantCodeContext
+} from '@/lib/types'
 import {
   cn,
   convertFilepath,
   encodeMentionPlaceHolder,
+  getRangeFromAttachmentCode,
   resolveFileNameForDisplay
 } from '@/lib/utils'
 import {
@@ -24,9 +30,11 @@ import { MemoizedReactMarkdown } from '@/components/markdown'
 
 import './style.css'
 
+import { SquareFunctionIcon } from 'lucide-react'
 import {
   FileLocation,
   Filepath,
+  ListSymbolItem,
   LookupSymbolHint,
   SymbolInfo
 } from 'tabby-chat-panel/index'
@@ -34,7 +42,8 @@ import {
 import {
   MARKDOWN_CITATION_REGEX,
   MARKDOWN_FILE_REGEX,
-  MARKDOWN_SOURCE_REGEX
+  MARKDOWN_SOURCE_REGEX,
+  MARKDOWN_SYMBOL_REGEX
 } from '@/lib/constants/regex'
 
 import { Mention } from '../mention-tag'
@@ -179,6 +188,18 @@ export function MessageMarkdown({
       } catch (e) {}
     })
 
+    processMatches(
+      MARKDOWN_SYMBOL_REGEX,
+      SymbolTag,
+      (match: RegExpExecArray) => {
+        const fullMatch = match[1]
+        return {
+          encodedSymbol: fullMatch,
+          openInEditor
+        }
+      }
+    )
+
     addTextNode(text.slice(lastIndex))
 
     return elements
@@ -190,33 +211,32 @@ export function MessageMarkdown({
 
     setSymbolLocationMap(map => new Map(map.set(keyword, undefined)))
     const hints: LookupSymbolHint[] = []
-    if (activeSelection && activeSelection?.range) {
-      // FIXME(@icycodes): this is intended to convert the filepath to Filepath type
-      // We should remove this after FileContext.filepath use type Filepath instead of string
-      let filepath: Filepath
-      if (
-        activeSelection.git_url.length > 1 &&
-        !activeSelection.filepath.includes(':')
-      ) {
-        filepath = {
-          kind: 'git',
-          filepath: activeSelection.filepath,
-          gitUrl: activeSelection.git_url
-        }
-      } else {
-        filepath = {
-          kind: 'uri',
-          uri: activeSelection.filepath
-        }
-      }
+
+    attachmentClientCode?.forEach(item => {
+      const code = item as AttachmentCodeItem
+
+      // FIXME(Sma1lboy): using getFilepathFromContext after refactor FileContext
       hints.push({
-        filepath,
-        location: {
-          start: activeSelection.range.start,
-          end: activeSelection.range.end
-        }
+        filepath: code.gitUrl
+          ? {
+              kind: 'git',
+              gitUrl: code.gitUrl,
+              filepath: code.filepath
+            }
+          : code.baseDir
+          ? {
+              kind: 'workspace',
+              filepath: code.filepath,
+              baseDir: code.baseDir
+            }
+          : {
+              kind: 'uri',
+              uri: code.filepath
+            },
+        location: getRangeFromAttachmentCode(code)
       })
-    }
+    })
+
     const symbolInfo = await onLookupSymbol(keyword, hints)
     setSymbolLocationMap(map => new Map(map.set(keyword, symbolInfo)))
   }
@@ -255,6 +275,7 @@ export function MessageMarkdown({
         components={{
           p({ children }) {
             return (
+              // FIXME
               <p className="mb-2 last:mb-0">
                 {children.map((child, index) =>
                   typeof child === 'string' ? (
@@ -292,6 +313,9 @@ export function MessageMarkdown({
                 {children}
               </CodeElement>
             )
+          },
+          hr() {
+            return null
           }
         }}
       >
@@ -344,7 +368,7 @@ function CitationTag({
   citationSource
 }: any) {
   return (
-    <div className="inline">
+    <span>
       {showcitation && (
         <>
           {citationType === 'doc' ? (
@@ -360,7 +384,7 @@ function CitationTag({
           ) : null}
         </>
       )}
-    </div>
+    </span>
   )
 }
 
@@ -449,6 +473,52 @@ function FileTag({
   )
 }
 
+function SymbolTag({
+  encodedSymbol,
+  openInEditor,
+  className
+}: {
+  encodedSymbol: string | undefined
+  className?: string
+  openInEditor?: MessageMarkdownProps['openInEditor']
+}) {
+  const symbol = useMemo(() => {
+    if (!encodedSymbol) return null
+    try {
+      const decodedSymbol = decodeURIComponent(encodedSymbol)
+      return JSON.parse(decodedSymbol) as ListSymbolItem
+    } catch (e) {
+      return null
+    }
+  }, [encodedSymbol])
+
+  const handleClick = () => {
+    if (!openInEditor || !symbol) return
+    openInEditor({
+      filepath: symbol.filepath,
+      location: symbol.range
+    })
+  }
+
+  if (!symbol?.label) return null
+
+  return (
+    <span
+      className={cn(
+        'symbol space-x-1 whitespace-nowrap border bg-muted py-0.5 align-middle leading-5',
+        className,
+        {
+          'hover:bg-muted/50 cursor-pointer': !!openInEditor
+        }
+      )}
+      onClick={handleClick}
+    >
+      <SquareFunctionIcon className="relative -top-px inline-block h-3.5 w-3.5" />
+      <span className="font-medium">{symbol.label}</span>
+    </span>
+  )
+}
+
 function RelevantDocumentBadge({
   relevantDocument,
   citationIndex
@@ -486,20 +556,80 @@ function RelevantCodeBadge({
     onCodeCitationMouseLeave
   } = useContext(MessageMarkdownContext)
 
+  const context: RelevantCodeContext = useMemo(() => {
+    return {
+      kind: 'file',
+      range: getRangeFromAttachmentCode(relevantCode),
+      filepath: relevantCode.filepath || '',
+      content: relevantCode.content,
+      git_url: ''
+    }
+  }, [relevantCode])
+
+  const isMultiLine =
+    context.range &&
+    !isNil(context.range?.start) &&
+    !isNil(context.range?.end) &&
+    context.range.start < context.range.end
+  const pathSegments = context.filepath.split('/')
+  const path = pathSegments.slice(0, pathSegments.length - 1).join('/')
+
+  const fileName = useMemo(() => {
+    return resolveFileNameForDisplay(context.filepath)
+  }, [context.filepath])
+
+  const rangeText = useMemo(() => {
+    if (!context.range) return undefined
+
+    let text = ''
+    if (context.range.start) {
+      text = String(context.range.start)
+    }
+    if (isMultiLine) {
+      text += `-${context.range.end}`
+    }
+    return text
+  }, [context.range])
+
   return (
-    <span
-      className="relative -top-2 mr-0.5 inline-block h-4 w-4 cursor-pointer rounded-full bg-muted text-center text-xs font-medium"
-      onClick={() => {
-        onCodeCitationClick?.(relevantCode)
-      }}
-      onMouseEnter={() => {
-        onCodeCitationMouseEnter?.(citationIndex)
-      }}
-      onMouseLeave={() => {
-        onCodeCitationMouseLeave?.(citationIndex)
-      }}
-    >
-      {citationIndex}
-    </span>
+    <HoverCard openDelay={100} closeDelay={100}>
+      <HoverCardTrigger>
+        <span
+          className="relative -top-2 mx-0.5 inline-block h-4 w-4 cursor-pointer rounded-full bg-muted text-center text-xs font-medium"
+          onClick={() => {
+            onCodeCitationClick?.(relevantCode)
+          }}
+          onMouseEnter={() => {
+            onCodeCitationMouseEnter?.(citationIndex)
+          }}
+          onMouseLeave={() => {
+            onCodeCitationMouseLeave?.(citationIndex)
+          }}
+        >
+          {citationIndex}
+        </span>
+      </HoverCardTrigger>
+      <HoverCardContent
+        className="max-w-[90vw] overflow-x-hidden bg-background py-2 text-sm text-foreground dark:border-muted-foreground/60 md:py-4 lg:w-96"
+        collisionPadding={8}
+      >
+        <div
+          className="cursor-pointer space-y-2 hover:opacity-70"
+          onClick={() => onCodeCitationClick?.(relevantCode)}
+        >
+          <div className="truncate whitespace-nowrap font-medium">
+            <span>{fileName}</span>
+            {rangeText ? (
+              <span className="text-muted-foreground">:{rangeText}</span>
+            ) : null}
+          </div>
+          {!!path && (
+            <div className="break-all text-xs text-muted-foreground">
+              {path}
+            </div>
+          )}
+        </div>
+      </HoverCardContent>
+    </HoverCard>
   )
 }
